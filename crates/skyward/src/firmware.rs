@@ -23,6 +23,13 @@ pub fn start(config: &FirmwarePartition) -> Result<()> {
         fs::create_dir_all(shown)?;
         skyward_block::mount::bind(at, shown)?;
     }
+    // Snapshot before ADSP starts. Health, SSC and secure apps may request
+    // more firmware later; they must never read a partition being flashed.
+    if let Err(error) = crate::firmware_snapshot::isolate(&config.partition) {
+        // A preparation failure must not take away the recovery UI. The
+        // installation gate rejects it before running any package script.
+        skyward_sys::kmsg(&format!("firmware isolation failed; installation blocked: {error:#}"))?;
+    }
     // A later vendor mount must not hide firmware while remoteproc is
     // requesting another segment of its image.
     fs::write("/sys/module/firmware_class/parameters/path", "/firmware/image")?;
