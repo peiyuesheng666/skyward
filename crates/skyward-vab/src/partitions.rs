@@ -395,12 +395,27 @@ pub fn mounted_partitions(slot: Slot) -> Result<Vec<Mounted>> {
 /// the tree, and those files and its device stay until let go. /metadata
 /// stays mounted for the update.
 pub fn release_partitions(slot: Slot, busy: &[PathBuf]) -> Result<()> {
-    for m in mounted_partitions(slot)?.into_iter().rev() {
+    let mounted = mounted_partitions(slot)?;
+    // Release unused devices while their parents still propagate unmounts
+    // to service namespaces. Parking firmware below a pinned /vendor makes
+    // rootfs private, which severs those parent relationships permanently
+    // for existing slave namespaces. Pinned mounts therefore leave last.
+    let unused = mounted.iter().rev().filter(|m| !busy.contains(&m.mount_point));
+    let pinned = mounted.iter().rev().filter(|m| busy.contains(&m.mount_point));
+    for m in unused.chain(pinned) {
         if busy.contains(&m.mount_point) {
             mount::umount_detach_over(&m.mount_point)?;
         } else {
+            let device = devnum(&m.device)?;
             mount::umount_over(&m.mount_point)?;
-            snapshots::unmap_snapshot(&m.partition)?;
+            if let Err(error) = snapshots::unmap_snapshot(&m.partition) {
+                let holders = match mount::namespace_holders(device) {
+                    Ok(found) if found.is_empty() => "no visible namespace mounts".to_string(),
+                    Ok(found) => found.join("; "),
+                    Err(e) => format!("namespace inspection failed: {e:#}"),
+                };
+                return Err(error).with_context(|| format!("release {} ({}:{}); {holders}", m.partition, device.0, device.1));
+            }
         }
     }
     Ok(())

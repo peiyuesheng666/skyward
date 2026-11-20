@@ -5,13 +5,13 @@ use skyward_programs::script::{Socket, SocketKind};
 use skyward_programs::secure::Started;
 use skyward_sys::ueventd;
 use skyward_vab::Mounted;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -413,16 +413,17 @@ fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, Own
     let sockets: Vec<RawFd> = handed.iter().map(|(_, socket)| socket.as_raw_fd()).collect();
     let mounts = s.mounts.iter().map(|m| Ok((CString::new(m.source.as_str())?, CString::new(m.target.as_str())?)))
         .collect::<Result<Vec<_>>>()?;
+    // Service-only binds must not escape into recovery, but inherited
+    // partition mounts must still receive recovery's unmounts. A private
+    // clone keeps otherwise unused logical devices open during detach.
     // Only system calls run between the fork and the exec, on what was
     // worked out before it. The sockets are open in the recovery so that
     // no other program it starts gets them, and in the program about to
     // run they have to stay open through the exec.
     unsafe {
         cmd.pre_exec(move || {
-            if !mounts.is_empty() && (libc::unshare(libc::CLONE_NEWNS) != 0
-                    || libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
-                        libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) != 0) {
-                return Err(io::Error::last_os_error());
+            if !mounts.is_empty() {
+                skyward_block::mount::service_namespace()?;
             }
             for (source, target) in &mounts {
                 if libc::mount(source.as_ptr(), target.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) != 0 {
@@ -445,33 +446,77 @@ fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, Own
 /// are written over, and give the mount points the files are on. The
 /// locked mappings stay for the rest of the recovery's life.
 pub fn pin(services: &[Service], mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
-    let mut files = BTreeSet::new();
+    let devices = mounted.iter().map(|m| Ok((skyward_block::devnum(&m.device)?, m.mount_point.clone())))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let mut files = BTreeMap::new();
     // A program run once has ended, and one between restarts has nothing in
     // memory to keep either.
     for s in services.iter().filter(|s| !s.oneshot) {
         let Some(pid) = running(&s.path) else { continue };
         let process = Process::new(pid as i32).with_context(|| format!("open process {pid}"))?;
-        for map in process.maps().with_context(|| format!("read the mappings of {}", s.path))? {
-            if let MMapPath::Path(p) = map.pathname {
-                files.insert(p);
+        let mut required = BTreeMap::new();
+        for map in process.maps().with_context(|| format!("read mappings of {}", s.path))? {
+            let device = (map.dev.0 as u32, map.dev.1 as u32);
+            if map.inode != 0 && devices.contains_key(&device) {
+                if let MMapPath::Path(path) = map.pathname {
+                    required.entry((device, map.inode)).or_insert(path);
+                } else {
+                    bail!("mapped partition file has no pathname: {device:?}:{}", map.inode);
+                }
             }
         }
+        // Enumerate the actual handles: Android's page-size compatibility
+        // layer can expose different range endpoints in maps and map_files.
+        // These handles also survive path changes after a lazy unmount.
+        for entry in fs::read_dir(format!("/proc/{pid}/map_files"))
+            .with_context(|| format!("read mapped files of {}", s.path))? {
+            let handle = entry?.path();
+            let metadata = match fs::metadata(&handle) {
+                Ok(metadata) => metadata,
+                // Page-size compatibility can enumerate handles whose
+                // synthetic end address cannot be opened. Every relevant
+                // device/inode is checked below; none is silently skipped.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).with_context(|| format!("stat {}", handle.display())),
+            };
+            let device = (libc::major(metadata.dev()) as u32, libc::minor(metadata.dev()) as u32);
+            if metadata.is_file() && devices.contains_key(&device) {
+                files.entry((device, metadata.ino())).or_insert(handle);
+            }
+        }
+        for (identity, path) in required {
+            if files.contains_key(&identity) { continue; }
+            let handle = PathBuf::from(format!("/proc/{pid}/root")).join(path.strip_prefix("/")?);
+            let metadata = fs::metadata(&handle).with_context(|| format!("resolve mapped file {}", handle.display()))?;
+            ensure!(metadata.is_file() && metadata.ino() == identity.1
+                && (libc::major(metadata.dev()) as u32, libc::minor(metadata.dev()) as u32) == identity.0,
+                "mapped file identity changed: {}", handle.display());
+            files.insert(identity, handle);
+        }
         for fd in process.fd().with_context(|| format!("read the files {} has open", s.path))? {
-            if let FDTarget::Path(p) = fd.with_context(|| format!("read a file {} has open", s.path))?.target {
-                files.insert(p);
+            let fd = fd.with_context(|| format!("read a file {} has open", s.path))?;
+            if let FDTarget::Path(_) = fd.target {
+                let handle = PathBuf::from(format!("/proc/{pid}/fd/{}", fd.fd));
+                let metadata = fs::metadata(&handle).with_context(|| format!("stat {}", handle.display()))?;
+                let device = (libc::major(metadata.dev()) as u32, libc::minor(metadata.dev()) as u32);
+                if metadata.is_file() && devices.contains_key(&device) {
+                    files.entry((device, metadata.ino())).or_insert(handle);
+                }
             }
         }
     }
     let mut busy: Vec<PathBuf> = Vec::new();
-    for file in files {
-        let Some(m) = mounted.iter().find(|m| file.starts_with(&m.mount_point)) else { continue };
-        if !fs::metadata(&file).with_context(|| format!("stat {}", file.display()))?.is_file() {
-            continue;
-        }
-        lock(&file)?;
+    for ((device, inode), file) in files {
+        let point = &devices[&device];
+        let opened = fs::File::open(&file).with_context(|| format!("open {}", file.display()))?;
+        let metadata = opened.metadata().with_context(|| format!("stat {}", file.display()))?;
+        anyhow::ensure!(metadata.is_file() && metadata.ino() == inode
+            && (libc::major(metadata.dev()) as u32, libc::minor(metadata.dev()) as u32) == device,
+            "{} no longer names the mapped service file", file.display());
+        lock(&opened, &file)?;
         let _ = skyward_sys::kmsg(&format!("kept {} in memory", file.display()));
-        if !busy.contains(&m.mount_point) {
-            busy.push(m.mount_point.clone());
+        if !busy.contains(point) {
+            busy.push(point.clone());
         }
     }
     Ok(busy)
@@ -479,8 +524,7 @@ pub fn pin(services: &[Service], mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
 
 /// Map `path` whole and lock the mapping: its pages then stay in memory
 /// for every process that maps the file.
-fn lock(path: &Path) -> Result<()> {
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+fn lock(file: &fs::File, path: &Path) -> Result<()> {
     let len = file.metadata().with_context(|| format!("stat {}", path.display()))?.len() as usize;
     if len == 0 {
         return Ok(());
@@ -490,7 +534,9 @@ fn lock(path: &Path) -> Result<()> {
         return Err(io::Error::last_os_error()).with_context(|| format!("map {}", path.display()));
     }
     if unsafe { libc::mlock(at, len) } != 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("lock {} in memory", path.display()));
+        let error = io::Error::last_os_error();
+        unsafe { libc::munmap(at, len); }
+        return Err(error).with_context(|| format!("lock {} in memory", path.display()));
     }
     Ok(())
 }
@@ -527,9 +573,13 @@ pub fn reachable() -> bool {
 
 /// A process already running `path`.
 pub fn running(path: &str) -> Option<u32> {
+    let identity = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
     fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
         let pid: u32 = e.file_name().to_str()?.parse().ok()?;
-        (fs::read_link(e.path().join("exe")).ok()? == Path::new(path)).then_some(pid)
+        let exe = e.path().join("exe");
+        let named = fs::read_link(&exe).ok().as_deref() == Some(Path::new(path));
+        let same_file = identity.is_some_and(|expected| fs::metadata(&exe).is_ok_and(|m| (m.dev(), m.ino()) == expected));
+        (named || same_file).then_some(pid)
     })
 }
 

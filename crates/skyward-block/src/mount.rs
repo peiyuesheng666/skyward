@@ -7,6 +7,20 @@ use std::path::Path;
 /// a device's fstab lists alternatives for one mount point.
 pub const FILESYSTEMS: [&str; 3] = ["erofs", "ext4", "f2fs"];
 
+/// Give a service its own binds without retaining stale copies of the
+/// recovery's shared partition mounts. Propagation is one-way: recovery
+/// unmounts reach the service; the service's binds never reach recovery.
+/// This is called after fork and therefore performs only system calls.
+pub fn service_namespace() -> io::Result<()> {
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0
+        || unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
+            libc::MS_REC | libc::MS_SLAVE, std::ptr::null()) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The words of a phone's mount options that the kernel takes as flags,
 /// as the phone's own fs_mgr reads them, with the kernel's bits for them
 /// (linux/mount.h); every other word is the filesystem's own.
@@ -365,6 +379,30 @@ mod sys {
         Ok(held()?.into_iter().filter(|h| h.devices.contains(&device)).map(|h| (h.pid, h.name)).collect())
     }
 
+    /// Mount references can keep a mapper open even when no process has
+    /// a file open on it. Report one process for each distinct namespace.
+    pub fn namespace_holders(device: (u32, u32)) -> Result<Vec<String>> {
+        let mut seen = HashSet::new();
+        let mut found = Vec::new();
+        let number = format!("{}:{}", device.0, device.1);
+        for process in all_processes().context("list mount namespace holders")? {
+            let Some(process) = present(process)? else { continue };
+            let path = Path::new("/proc").join(process.pid().to_string());
+            let namespace = match fs::read_link(path.join("ns/mnt")) {
+                Ok(ns) => ns,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).context("read mount namespace identity"),
+            };
+            if !seen.insert(namespace.clone()) { continue; }
+            let Some(mounts) = present(process.mountinfo())? else { continue };
+            let exe = fs::read_link(path.join("exe")).unwrap_or_default();
+            for m in mounts.0.into_iter().filter(|m| m.majmin == number) {
+                found.push(format!("pid {} {} {} at {}", process.pid(), exe.display(), namespace.display(), m.mount_point.display()));
+            }
+        }
+        Ok(found)
+    }
+
     /// A process and what it holds: the devices of the filesystems it has a
     /// file of mapped or open, or a directory of as its working or root
     /// directory.
@@ -492,10 +530,14 @@ mod sys {
     pub fn holding(_device: (u32, u32)) -> Result<Vec<(i32, String)>> {
         bail!("this host does not look up which programs hold a filesystem")
     }
+
+    pub fn namespace_holders(_device: (u32, u32)) -> Result<Vec<String>> {
+        bail!("this host does not look up mount namespace holders")
+    }
 }
 
 pub use sys::{
-    bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
+    bind, holders, holding, namespace_holders, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
     umount_detach, umount_detach_over, umount_over, visible,
 };
 
